@@ -1,0 +1,66 @@
+# Builds standalone MintScope executables when a version tag (v*) is pushed and attaches them to a
+# GitHub Release. macOS arm64 (Apple Silicon), macOS x64 (Intel), Windows x64 and Linux x64.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, label: macos-arm64 }        # Apple Silicon
+          - { os: macos-15-intel, label: macos-x64 }    # Intel (last x64 macOS runner, until Aug 2027)
+          - { os: windows-latest, label: windows-x64 }
+          - { os: ubuntu-22.04, label: linux-x64 }      # older glibc = runs on more Linux distros
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt pyinstaller
+      - run: python scripts/build_exe.py
+      - name: Package
+        shell: bash
+        run: |
+          cd dist
+          for f in mintscope-*; do
+            if [[ "$f" == *.exe ]]; then 7z a "${f%.exe}.zip" "$f"; else chmod +x "$f"; tar czf "$f.tar.gz" "$f"; fi
+          done
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - run: cd artifacts && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

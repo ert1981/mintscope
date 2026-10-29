@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mintscope"
+version = "0.7.0"
+description = "MintScope AI: evidence-based NFT risk analysis and new-launch discovery (local app + API)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+  "fastapi>=0.110,<1.0",
+  "uvicorn>=0.27",
+  "requests>=2.31",
+  "cryptography>=42",
+  "keyring>=24",
+]
+
+[project.scripts]
+mintscope = "cli:main"
+
+[tool.setuptools]
+py-modules = ["analyzer", "app", "cli", "config", "data_store", "discovery", "featured", "keystore",
+              "license_pubkey", "licensing", "local_mode", "local_ui", "onchain", "pages", "payments",
+              "providers", "routes_featured", "tool_manifest"]

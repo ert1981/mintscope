@@ -1,0 +1,22 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.key
+# environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# local data
+*.db
+*.sqlite
+*.sqlite3
+data/
+*.pem
+license_ed25519*
+# build output
+build/
+dist/
+*.spec
