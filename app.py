@@ -26,6 +26,7 @@ import local_mode
 import routes_featured
 import pages
 import register_page
+import deactivate_page
 import payments
 import tool_manifest
 from config import Settings, get_settings
@@ -340,6 +341,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def register_onchain():
         """Static page: the creator signs the ERC-8257 registrations with their own browser wallet."""
         return HTMLResponse(register_page.page(), headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
+
+    @app.get("/deactivate-onchain", response_class=HTMLResponse, include_in_schema=False)
+    def deactivate_onchain():
+        """Creator removes duplicate tool registrations (#816, #817) with their own wallet."""
+        return HTMLResponse(deactivate_page.page(), headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
 
     @app.get("/health")
     def health():

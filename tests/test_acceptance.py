@@ -162,7 +162,23 @@ PLACEHOLDER = re.compile(r"(?i)your_|<|example|xxx")
 PUBLIC_TOPICS = {
     "0xe90cf9cc0a552cf52ea6ff74ece0f1c8ae8cc9ad630d3181f55ac43ca076b7d6",
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    # ERC-8257 ToolRegistry events: ToolRegistered and ToolDeregistered (register/deactivate pages).
+    "0xe7be7fd3c802f61682f56ba817276b1cc81fbee7cb50705c8ed7952811dac397",
+    "0x9add33e854e243f868ff7cacac076d65b1d56fb593e2bb891e76e2e8d5ddd034",
 }
+
+
+def _public_onchain_constants():
+    """Public on-chain values (manifest hashes, tx hashes) published on the register/deactivate pages."""
+    import deactivate_page
+    import register_page
+    vals = {t["manifest_hash"].lower() for t in register_page.TOOLS}
+    vals |= {d["reg_tx"].lower() for d in deactivate_page.DUPLICATES}
+    return vals
+
+
+PUBLIC_TOPICS |= _public_onchain_constants()
+CALLDATA_SELECTORS = ("0xfe1d0b16", "0x9148e6ca")
 
 
 def _tracked_files():
@@ -192,6 +208,8 @@ def test_no_secrets_in_repo():
                     continue  # this file contains the patterns themselves
                 if m.group(0).lower() in PUBLIC_TOPICS:
                     continue
+                if m.group(0).lower().startswith(CALLDATA_SELECTORS):
+                    continue  # public ABI calldata (registerTool / deregisterTool), not a key
                 if PLACEHOLDER.search(m.group(0)):
                     continue  # documented placeholder such as "your_key"
                 raise AssertionError(f"possible secret in {path.name}: {m.group(0)[:40]}")
