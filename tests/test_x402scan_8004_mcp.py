@@ -138,6 +138,8 @@ def test_register_8004_page_shows_exact_calldata(make_client):
     assert "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" in r.text
     assert "0x93714D5970f511Ac22f0E5635D3fBF538f717cd4" in r.text
     assert not re.search(r"__[A-Z_]+__", r.text)
+    # wallet discovery (late injection / EIP-6963), clear no-wallet guidance, non-blocking log scan with timeout
+    assert "eip6963:requestProvider" in r.text and "Open in MetaMask" in r.text and "timeout (" in r.text
 
 
 def test_encode_register_matches_cast():

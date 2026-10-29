@@ -160,6 +160,8 @@ SECRET_PATTERNS = [
 PLACEHOLDER = re.compile(r"(?i)your_|<|example|xxx")
 # Public keccak256 event topics used by discovery.py (not secrets): SeaDropMint and ERC-721 Transfer.
 PUBLIC_TOPICS = {
+    # ERC-8004 IdentityRegistry Registered(uint256,string,address) (/register-8004 page).
+    "0xca52e62c367d81bb2e328eb795f7c7ba24afb478408a26c0e201d155c449bc4a",
     "0xe90cf9cc0a552cf52ea6ff74ece0f1c8ae8cc9ad630d3181f55ac43ca076b7d6",
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
     # ERC-8257 ToolRegistry events: ToolRegistered and ToolDeregistered (register/deactivate pages).
@@ -178,7 +180,7 @@ def _public_onchain_constants():
 
 
 PUBLIC_TOPICS |= _public_onchain_constants()
-CALLDATA_SELECTORS = ("0xfe1d0b16", "0x9148e6ca")
+CALLDATA_SELECTORS = ("0xfe1d0b16", "0x9148e6ca", "0xf2c298be")  # + ERC-8004 register(string)
 
 
 def _tracked_files():
