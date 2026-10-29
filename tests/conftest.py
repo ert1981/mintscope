@@ -14,7 +14,8 @@ os.environ["MINTSCOPE_MODE"] = "auto"
 # Legacy tests check the full report; pricing tests turn pricing on explicitly.
 os.environ["MINTSCOPE_PRICING"] = "off"
 for _k in ("MINTSCOPE_LOCAL", "MINTSCOPE_ADMIN_TOKEN", "MINTSCOPE_SPONSORED_ENABLED", "MINTSCOPE_FEATURED_FEED_URL",
-           "MINTSCOPE_PAYEE_ADDRESS", "MINTSCOPE_X402_NETWORK", "MINTSCOPE_X402_FACILITATOR_URL"):
+           "MINTSCOPE_PAYEE_ADDRESS", "MINTSCOPE_X402_NETWORK", "MINTSCOPE_X402_FACILITATOR_URL",
+           "CDP_API_KEY_ID", "CDP_API_KEY_SECRET"):
     os.environ.pop(_k, None)
 
 

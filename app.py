@@ -5,7 +5,9 @@ Docs: http://127.0.0.1:8000/docs
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
+import json
 import threading
 from types import SimpleNamespace
 import secrets
@@ -16,7 +18,9 @@ from typing import Literal
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import analyzer
@@ -27,6 +31,7 @@ import routes_featured
 import pages
 import register_page
 import deactivate_page
+import icon
 import payments
 import tool_manifest
 from config import Settings, get_settings
@@ -103,6 +108,46 @@ class DiscoverRequest(BaseModel):
     chain: Literal["all", "ethereum", "base"] = Field("all", description="Chain to scan")
     limit: int = Field(10, ge=1, le=50, description="Maximum number of ranked collections to return")
     tier: Literal["auto", "free", "full"] = Field("auto", description="Same meaning as for /analyze")
+
+
+# x402 v2 / CDP Bazaar discovery metadata per paid route. Descriptive text only (the Bazaar refuses
+# metadata that reads like instructions to an agent). Schemas are copies of the ERC-8257 manifest inputs/
+# outputs; the manifests themselves are not touched (their onchain hashes must not change).
+ICON_PATH = "/static/icon.png"
+BAZAAR_ROUTES = {
+    "/analyze": {
+        "description": "Evidence-based NFT collection risk report: verified OpenSea market data, realized sales "
+                       "versus listings, creator evidence, risk flags, missing data and a confidence level. "
+                       "Not a profit prediction.",
+        "tags": ["nft", "analytics", "risk", "opensea", "base"],
+        "example": {"identifier": "boredapeyachtclub", "chain": "ethereum", "tier": "full"},
+        "body_schema": tool_manifest.INPUTS,
+        "output_schema": tool_manifest.OUTPUTS,
+        "output_example": {"tier": "full", "data_mode": "live", "project": {"name": "Bored Ape Yacht Club"},
+                           "risk_flags": [], "missing_data": [], "confidence": {"level": "medium"},
+                           "payment": {"status": "settled", "amount_usdc": "2.99"},
+                           "disclaimer": "Evidence summary, not financial advice or a profit prediction."},
+    },
+    "/discover": {
+        "description": "New NFT collections launched on Ethereum and Base in the last day, week or month, found "
+                       "from onchain contract deployments and ranked by evidence-based risk analysis. "
+                       "Not a profit prediction.",
+        "tags": ["nft", "discovery", "new-collections", "ethereum", "base"],
+        "example": {"period": "today", "chain": "all", "limit": 10, "tier": "full"},
+        "body_schema": tool_manifest.DISCOVER_INPUTS,
+        "output_schema": tool_manifest.DISCOVER_OUTPUTS,
+        "output_example": {"tier": "full", "period": "today", "collections": [],
+                           "payment": {"status": "settled", "amount_usdc": "2.99"}},
+    },
+}
+
+
+def bazaar_extension(path: str) -> dict | None:
+    meta = BAZAAR_ROUTES.get(path)
+    if not meta:
+        return None
+    return payments.bazaar_body_extension(copy.deepcopy(meta["example"]), copy.deepcopy(meta["body_schema"]),
+                                          copy.deepcopy(meta["output_example"]), copy.deepcopy(meta["output_schema"]))
 
 
 def resolve_mode(requested: str, settings: Settings) -> str:
@@ -219,7 +264,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     x402 = payments.X402Config(payee=settings.payee_address, price_usdc=settings.price_usdc,
                                network=settings.x402_network) if settings.paid_enabled else None
-    facilitator = payments.Facilitator(settings.facilitator_url)
+    # CDP Facilitator only when CDP_API_KEY_ID and CDP_API_KEY_SECRET are both set; else PayAI as before.
+    facilitator = payments.make_facilitator(settings.facilitator_url)
 
     def caller_ids(request: Request) -> list[str]:
         """Free-tier identities: always the client IP; also the wallet in X-Payer-Address when given.
@@ -239,9 +285,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return f"{settings.public_base_url}{request.url.path}{q}"
         return str(request.url).split("#")[0]
 
-    def payment_required(requirements: dict, error: str) -> JSONResponse:
-        return JSONResponse(payments.challenge(requirements, error), status_code=402,
-                            headers={"X-Accept-Payment": "x402"})
+    def public_base(request: Request) -> str:
+        return settings.public_base_url or str(request.base_url).rstrip("/")
+
+    def payment_required(requirements: dict, error: str, request: Request) -> JSONResponse:
+        """v1 JSON body (unchanged, what OpenSea's tool-sdk reads) + x402 v2 PAYMENT-REQUIRED header."""
+        meta = BAZAAR_ROUTES.get(request.url.path, {})
+        resource = {"url": requirements["resource"],
+                    "description": meta.get("description", requirements["description"]),
+                    "mimeType": "application/json", "serviceName": "MintScope",
+                    "iconUrl": f"{public_base(request)}{ICON_PATH}"}
+        if meta.get("tags"):
+            resource["tags"] = meta["tags"]
+        v2 = payments.payment_required_v2(x402, resource, error, bazaar_extension(request.url.path))
+        return JSONResponse(payments.challenge(requirements, error), status_code=402, headers={
+            "X-Accept-Payment": "x402",
+            payments.PAYMENT_REQUIRED_HEADER: payments.encode_header(v2),
+            "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE"})
+
+    def payment_header(request: Request) -> tuple[str | None, int]:
+        """(header value, x402 version): v2 clients send PAYMENT-SIGNATURE, v1 clients X-Payment."""
+        v2 = request.headers.get(payments.PAYMENT_SIGNATURE_HEADER)
+        if v2:
+            return v2, 2
+        return request.headers.get("X-Payment"), 1
 
     def price_info() -> dict:
         return {"price_usdc": settings.price_usdc, "network": settings.x402_network, "protocol": "x402",
@@ -250,36 +317,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "available": False, "note": "The paid tier is not configured on this server."}
 
     def wants_paid(tier: str, request: Request) -> bool:
-        return tier == "full" or (tier == "auto" and bool(request.headers.get("X-Payment")))
+        return tier == "full" or (tier == "auto" and bool(payment_header(request)[0]))
 
     def paid_response(request: Request, description: str, produce) -> JSONResponse:
         """x402 flow mirroring @opensea/tool-sdk's hosted gate with a replay guard and required settlement."""
         if not x402:
             raise HTTPException(503, "The paid tier is not configured (MINTSCOPE_PAYEE_ADDRESS is not set).")
         requirements = x402.requirements(resource_url(request), description)
-        header = request.headers.get("X-Payment")
+        header, version = payment_header(request)
         if not header:
-            return payment_required(requirements, "X-PAYMENT header is required")
+            return payment_required(requirements, "X-PAYMENT header is required", request)
         try:
             payment = payments.decode_payment(header)
-            verified = facilitator.verify(payment, requirements)
+            if version == 2 or payment.get("x402Version") == 2:
+                # v2: verify against our own v2 requirements; the client's `accepted` must match them.
+                version = 2
+                facil_requirements = x402.requirements_v2()
+                accepted = payment.get("accepted") or {}
+                if any(str(accepted.get(k, "")).lower() != str(facil_requirements[k]).lower()
+                       for k in ("scheme", "network", "asset", "amount", "payTo")):
+                    raise payments.PaymentError(402, "payment_requirements_mismatch")
+            else:
+                facil_requirements = requirements
+            verified = facilitator.verify(payment, facil_requirements)
         except payments.PaymentError as exc:
             if exc.status == 402:
-                return payment_required(requirements, exc.error)
+                return payment_required(requirements, exc.error, request)
             raise HTTPException(exc.status, exc.error)
+        # Same (payer, nonce) key for v1 and v2: one onchain authorization can be used once.
         key = payments.replay_key(payment, x402.network, x402.asset)
         if not key:
-            return payment_required(requirements, "invalid_payload")
+            return payment_required(requirements, "invalid_payload", request)
         if not store.reserve_authorization(key):
-            return payment_required(requirements, "payment_authorization_already_used")
+            return payment_required(requirements, "payment_authorization_already_used", request)
         # If producing the report fails, nothing is settled (the caller is not charged) and the
         # reservation is kept, so one authorization cannot be used to run the handler repeatedly.
         result = produce()
-        settled, retryable = facilitator.settle(payment, requirements)
+        settled, retryable = facilitator.settle(payment, facil_requirements)
         if not settled:
             if retryable:
                 store.release_authorization(key)
-            return payment_required(requirements, "settlement_failed")
+            return payment_required(requirements, "settlement_failed", request)
         tx = str(settled["transaction"])[:100]
         payer = str(settled.get("payer") or verified.get("payer") or "")[:42]
         store.mark_settled(key, tx)
@@ -288,7 +366,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                           f"tx={tx} payer={payer} network={x402.network} path={request.url.path}")
         result["payment"] = {"status": "settled", "transaction": tx, "network": settled.get("network", x402.network),
                              "payer": payer or None, "amount_usdc": settings.price_usdc}
-        return JSONResponse(result, headers={"X-PAYMENT-RESPONSE": payments.payment_response_header(settled, x402.network)})
+        receipt = payments.payment_response_header(settled, x402.network)
+        headers = {"X-PAYMENT-RESPONSE": receipt}
+        if version == 2:
+            headers[payments.PAYMENT_RESPONSE_HEADER] = payments.encode_header(
+                {"success": True, "transaction": tx, "network": settled.get("network") or x402.caip2,
+                 "payer": payer or None})
+        return JSONResponse(result, headers=headers)
 
     def use_free(request: Request) -> int:
         left = store.consume_free(caller_ids(request), month(), settings.free_analyses_per_month)
@@ -300,7 +384,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         msg = (f"Free tier used up: {settings.free_analyses_per_month} analyses per month. "
                f"Full reports cost {settings.price_usdc} USDC.")
         if x402 and payable:
-            return payment_required(x402.requirements(resource_url(request), description), msg)
+            return payment_required(x402.requirements(resource_url(request), description), msg, request)
         raise HTTPException(429, msg + (" Paid reports need live data (this request is in demo mode)."
                                         if x402 else " The paid tier is not configured on this server."))
 
@@ -312,6 +396,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.store = store
+    app.state.facilitator_kind = facilitator.kind
+
+    paid_descriptions = {"/analyze": "MintScope full NFT risk report", "/discover": "MintScope new NFT launches, full data"}
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        """An empty body (or `{}`) on a paid route without a payment header answers 402 with the payment
+        requirements (x402 discovery probes send the example input or an empty body). Any other invalid input,
+        or an invalid body sent together with a payment, still gets 422, so nothing is charged for bad input."""
+        if (x402 and settings.pricing_enabled and request.method == "POST" and request.url.path in paid_descriptions
+                and not payment_header(request)[0]
+                and (request.url.path != "/analyze" or (settings.live_available and settings.mode != "demo"))):
+            raw = (await request.body()).strip()
+            empty = not raw
+            if not empty:
+                try:
+                    empty = json.loads(raw) == {}
+                except ValueError:
+                    empty = False
+            if empty:
+                description = f"{paid_descriptions[request.url.path]} ({settings.price_usdc} USDC)"
+                return payment_required(x402.requirements(resource_url(request), description),
+                                        "X-PAYMENT header is required", request)
+        return await request_validation_exception_handler(request, exc)
+
+    @app.get(ICON_PATH, include_in_schema=False)
+    def icon_png():
+        return Response(icon.png_bytes(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
     def set_opensea_key(value: str | None) -> None:
         """Local mode: swap in the user's own key from the device keystore (never logged or returned)."""

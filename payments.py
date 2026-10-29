@@ -11,11 +11,21 @@ ERC-8257 tools charge (mirrors @opensea/tool-sdk's hosted x402 gate):
 
 MintScope never holds a key or signs anything: the facilitator broadcasts the caller's signed
 authorization, and USDC goes straight to MINTSCOPE_PAYEE_ADDRESS.
+
+x402 v2 (agentic.market / CDP Bazaar discovery): the same 402 also carries a base64 `PAYMENT-REQUIRED`
+header (x402Version 2, CAIP-2 network, `resource` info with iconUrl, `extensions.bazaar` metadata), and a v2
+client may pay with the `PAYMENT-SIGNATURE` header. The v1 JSON body is unchanged.
+
+Facilitator: PayAI by default (what the live OpenSea tools use). Only when BOTH CDP_API_KEY_ID and
+CDP_API_KEY_SECRET are set in the environment is the CDP Facilitator used (needed for Bazaar indexing).
+The CDP key values are read from the environment at startup and never stored in Settings, logged or returned.
 """
 from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -32,6 +42,10 @@ ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 NONCE_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 REJECTED = {"0x" + "0" * 40, "0x000000000000000000000000000000000000dead"}
 FACILITATOR_TIMEOUT = 10.0
+CDP_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
+PAYMENT_REQUIRED_HEADER = "PAYMENT-REQUIRED"
+PAYMENT_SIGNATURE_HEADER = "PAYMENT-SIGNATURE"
+PAYMENT_RESPONSE_HEADER = "PAYMENT-RESPONSE"
 
 
 class PaymentError(Exception):
@@ -87,6 +101,62 @@ class X402Config:
             "extra": {"name": USDC[self.network][2], "version": "2"},
         }
 
+    @property
+    def caip2(self) -> str:
+        return f"eip155:{USDC[self.network][0]}"
+
+    def requirements_v2(self) -> dict:
+        """x402 v2 PaymentRequirements (CAIP-2 network, `amount` instead of `maxAmountRequired`)."""
+        return {
+            "scheme": "exact", "network": self.caip2, "asset": self.asset, "amount": self.amount,
+            "payTo": self.payee, "maxTimeoutSeconds": self.max_timeout_seconds,
+            "extra": {"name": USDC[self.network][2], "version": "2"},
+        }
+
+
+def bazaar_body_extension(example_body: dict, body_schema: dict, output_example: dict,
+                          output_schema: dict | None = None) -> dict:
+    """`extensions.bazaar` for a JSON-body POST route, in the shape produced by
+    x402.extensions.bazaar.declare_discovery_extension(body_type="json") plus the route method."""
+    example = {"type": "json", "example": output_example}
+    out_schema = {"type": "object", "properties": {"type": {"type": "string"},
+                                                   "example": {"type": "object", **(output_schema or {})}},
+                  "required": ["type"]}
+    return {"bazaar": {
+        "info": {"input": {"type": "http", "method": "POST", "bodyType": "json", "body": example_body},
+                 "output": example},
+        "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "const": "http"},
+                        "method": {"type": "string", "enum": ["POST", "PUT", "PATCH"]},
+                        "bodyType": {"type": "string", "enum": ["json", "form-data", "text"]},
+                        "body": body_schema,
+                    },
+                    "required": ["type", "method", "bodyType", "body"],
+                    "additionalProperties": False,
+                },
+                "output": out_schema,
+            },
+            "required": ["input"],
+        },
+    }}
+
+
+def payment_required_v2(x402: "X402Config", resource: dict, error: str, extensions: dict | None) -> dict:
+    body = {"x402Version": 2, "error": error, "resource": resource, "accepts": [x402.requirements_v2()]}
+    if extensions:
+        body["extensions"] = extensions
+    return body
+
+
+def encode_header(obj: dict) -> str:
+    return base64.b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode()
+
 
 def challenge(requirements: dict, error: str = "X-PAYMENT header is required") -> dict:
     return {"x402Version": 1, "error": error, "accepts": [requirements]}
@@ -98,6 +168,8 @@ def decode_payment(header: str) -> dict:
     except (ValueError, UnicodeDecodeError):
         raise PaymentError(402, "invalid_payload")
     if not isinstance(payload, dict) or not isinstance(payload.get("payload"), dict):
+        raise PaymentError(402, "invalid_payload")
+    if payload.get("x402Version") == 2 and not isinstance(payload.get("accepted"), dict):
         raise PaymentError(402, "invalid_payload")
     return payload
 
@@ -112,6 +184,9 @@ def replay_key(payment: dict, network: str, asset: str) -> str | None:
 
 
 class Facilitator:
+    """PayAI (or any plain HTTP facilitator without auth). Unchanged behavior for v1 payments."""
+    kind = "payai"
+
     def __init__(self, url: str, timeout: float = FACILITATOR_TIMEOUT):
         self.url = url.rstrip("/")
         self.timeout = timeout
@@ -159,3 +234,64 @@ def payment_response_header(settled: dict, network: str) -> str:
     body = {"success": True, "transaction": settled.get("transaction"), "network": settled.get("network", network),
             "payer": settled.get("payer")}
     return base64.b64encode(json.dumps(body).encode()).decode()
+
+
+class CdpFacilitator:
+    """CDP Facilitator via the official `x402` package + `cdp-sdk` auth headers (JWT per request).
+    Same verify()/settle() contract as Facilitator."""
+    kind = "cdp"
+
+    def __init__(self, api_key_id: str, api_key_secret: str, timeout: float = FACILITATOR_TIMEOUT):
+        from cdp.x402 import create_facilitator_config  # imported only when CDP keys are configured
+        from x402.http import HTTPFacilitatorClientSync
+        cfg = create_facilitator_config(api_key_id, api_key_secret)
+        try:
+            from x402.http import FacilitatorConfig, CreateHeadersAuthProvider
+            self.client = HTTPFacilitatorClientSync(FacilitatorConfig(
+                url=cfg["url"], auth_provider=CreateHeadersAuthProvider(cfg["create_headers"]), timeout=timeout))
+        except ImportError:  # older x402 releases accept the plain dict config
+            self.client = HTTPFacilitatorClientSync(cfg)
+        self.url = cfg["url"]
+
+    @staticmethod
+    def _bytes(obj: dict) -> bytes:
+        return json.dumps(obj).encode()
+
+    def verify(self, payment: dict, requirements: dict) -> dict:
+        import httpx
+        try:
+            res = self.client.verify_from_bytes(self._bytes(payment), self._bytes(requirements))
+        except (httpx.HTTPError, ValueError):
+            raise PaymentError(502, "payment_facilitator_unreachable")
+        data = res.model_dump(by_alias=True)
+        if data.get("isValid") is not True:
+            raise PaymentError(402, str(data.get("invalidReason") or "invalid_payment")[:120])
+        return data
+
+    def settle(self, payment: dict, requirements: dict) -> tuple[dict | None, bool]:
+        import httpx
+        try:
+            res = self.client.settle_from_bytes(self._bytes(payment), self._bytes(requirements))
+        except httpx.TransportError:
+            return None, True
+        except (httpx.HTTPError, ValueError):
+            return None, False
+        data = res.model_dump(by_alias=True)
+        if data.get("success") is not True or not data.get("transaction"):
+            return None, False
+        return data, False
+
+
+def make_facilitator(settings_url: str, env=None):
+    """CDP only when BOTH key env vars are set; otherwise the configured (PayAI) facilitator, unchanged."""
+    env = os.environ if env is None else env
+    key_id = (env.get("CDP_API_KEY_ID") or "").strip()
+    key_secret = (env.get("CDP_API_KEY_SECRET") or "").strip()
+    if key_id and key_secret:
+        try:
+            return CdpFacilitator(key_id, key_secret)
+        except ImportError:
+            # Packages missing: keep serving with the default facilitator rather than failing to start.
+            logging.getLogger("mintscope").warning("CDP keys set but x402/cdp-sdk not installed; using %s",
+                                                   settings_url)
+    return Facilitator(settings_url)

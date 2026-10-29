@@ -21,6 +21,6 @@ dependencies = [
 mintscope = "cli:main"
 
 [tool.setuptools]
-py-modules = ["analyzer", "app", "cli", "config", "data_store", "discovery", "featured", "keystore",
+py-modules = ["analyzer", "app", "cli", "config", "data_store", "discovery", "featured", "icon", "keystore",
               "license_pubkey", "licensing", "local_mode", "local_ui", "onchain", "pages", "payments",
               "providers", "routes_featured", "tool_manifest"]
