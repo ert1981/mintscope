@@ -25,6 +25,7 @@ import featured
 import local_mode
 import routes_featured
 import pages
+import register_page
 import payments
 import tool_manifest
 from config import Settings, get_settings
@@ -334,6 +335,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return pages.landing_page(settings)
 
     routes_featured.register(app, settings, featured_service)
+
+    @app.get("/register-onchain", response_class=HTMLResponse, include_in_schema=False)
+    def register_onchain():
+        """Static page: the creator signs the ERC-8257 registrations with their own browser wallet."""
+        return HTMLResponse(register_page.page(), headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
 
     @app.get("/health")
     def health():
