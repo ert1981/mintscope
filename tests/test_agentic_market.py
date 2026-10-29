@@ -135,6 +135,7 @@ def test_bazaar_metadata_validates_and_is_descriptive(priced, path, example):
 
 
 def test_v2_payment_required_parses_with_official_x402_models(priced):
+    pytest.importorskip("jsonschema")  # x402's bazaar helpers need it (test-only; the app does not import them)
     x402_schemas = pytest.importorskip("x402.schemas")
     bazaar = pytest.importorskip("x402.extensions.bazaar")
     from x402.extensions.bazaar.types import parse_discovery_extension
