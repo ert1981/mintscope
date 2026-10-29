@@ -8,6 +8,8 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import os
+import re
 import threading
 from types import SimpleNamespace
 import secrets
@@ -20,7 +22,9 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import analyzer
@@ -31,6 +35,8 @@ import routes_featured
 import pages
 import register_page
 import deactivate_page
+import erc8004
+import mcp_server
 import icon
 import payments
 import tool_manifest
@@ -40,6 +46,8 @@ from providers import (CHAINS, NON_EVM_CHAINS, DemoProvider, NotFound, OpenSeaPr
                        classify_identifier, normalize_identifier)
 
 VERSION = "0.7.0"
+# 402index.io domain-claim verification hash for mintscope-zrvv.onrender.com (public by design).
+INDEX402_VERIFY_HASH = "d2f60449e30a87218db49c57d852d5f94f77f2add2adb347e484b2c0d599f045"
 
 
 class AnalyzeRequest(BaseModel):
@@ -327,6 +335,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         header, version = payment_header(request)
         if not header:
             return payment_required(requirements, "X-PAYMENT header is required", request)
+        out = charge(header, version, requirements, produce, request.url.path)
+        if out["status"] == "challenge":
+            return payment_required(requirements, out["error"], request)
+        return JSONResponse(out["result"], headers=out["headers"])
+
+    def charge(header, version: int, requirements: dict, produce, path: str) -> dict:
+        """verify -> replay reservation -> produce -> settle. Shared by HTTP routes and MCP tool calls.
+        Returns {"status": "challenge", "error"} or {"status": "ok", "result", "headers", "receipt"}."""
         try:
             payment = payments.decode_payment(header)
             if version == 2 or payment.get("x402Version") == 2:
@@ -342,14 +358,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             verified = facilitator.verify(payment, facil_requirements)
         except payments.PaymentError as exc:
             if exc.status == 402:
-                return payment_required(requirements, exc.error, request)
+                return {"status": "challenge", "error": exc.error}
             raise HTTPException(exc.status, exc.error)
         # Same (payer, nonce) key for v1 and v2: one onchain authorization can be used once.
         key = payments.replay_key(payment, x402.network, x402.asset)
         if not key:
-            return payment_required(requirements, "invalid_payload", request)
+            return {"status": "challenge", "error": "invalid_payload"}
         if not store.reserve_authorization(key):
-            return payment_required(requirements, "payment_authorization_already_used", request)
+            return {"status": "challenge", "error": "payment_authorization_already_used"}
         # If producing the report fails, nothing is settled (the caller is not charged) and the
         # reservation is kept, so one authorization cannot be used to run the handler repeatedly.
         result = produce()
@@ -357,22 +373,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not settled:
             if retryable:
                 store.release_authorization(key)
-            return payment_required(requirements, "settlement_failed", request)
+            return {"status": "challenge", "error": "settlement_failed"}
         tx = str(settled["transaction"])[:100]
         payer = str(settled.get("payer") or verified.get("payer") or "")[:42]
         store.mark_settled(key, tx)
         # Revenue is recorded only now, after the facilitator confirmed settlement.
         store.record_cost("x402_payment", float(settings.price_usdc), "x402",
-                          f"tx={tx} payer={payer} network={x402.network} path={request.url.path}")
+                          f"tx={tx} payer={payer} network={x402.network} path={path}")
         result["payment"] = {"status": "settled", "transaction": tx, "network": settled.get("network", x402.network),
                              "payer": payer or None, "amount_usdc": settings.price_usdc}
         receipt = payments.payment_response_header(settled, x402.network)
         headers = {"X-PAYMENT-RESPONSE": receipt}
+        receipt_v2 = {"success": True, "transaction": tx, "network": settled.get("network") or x402.caip2,
+                      "payer": payer or None}
         if version == 2:
-            headers[payments.PAYMENT_RESPONSE_HEADER] = payments.encode_header(
-                {"success": True, "transaction": tx, "network": settled.get("network") or x402.caip2,
-                 "payer": payer or None})
-        return JSONResponse(result, headers=headers)
+            headers[payments.PAYMENT_RESPONSE_HEADER] = payments.encode_header(receipt_v2)
+        return {"status": "ok", "result": result, "headers": headers, "receipt": receipt_v2}
 
     def use_free(request: Request) -> int:
         left = store.consume_free(caller_ids(request), month(), settings.free_analyses_per_month)
@@ -470,13 +486,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "default_effective_mode": "live" if settings.live_available and settings.mode != "demo" else "demo",
         }
 
-    @app.post("/analyze")
-    def analyze(body: AnalyzeRequest, request: Request, x_api_token: str | None = Header(default=None, alias="X-API-Token")):
-        authorize(x_api_token)
-        client = request.client.host if request.client else "unknown"
-        if not limiter.allow(client):
-            raise HTTPException(429, f"Local usage limit: {settings.rate_limit_per_minute} analyses per minute.")
-
+    def make_analysis(body: AnalyzeRequest):
+        """(mode, build) for one analysis request; shared by POST /analyze and the MCP tool."""
         mode = resolve_mode(body.mode, settings)
         id_type = classify_identifier(body.identifier)
 
@@ -489,6 +500,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             report = analyzer.build_report(raw, body.identifier, id_type, body.chain, mode)
             store.save_report(report)
             return report
+        return mode, build
+
+    def get_challenge(request: Request, path: str, description: str):
+        """GET/HEAD probe (x402dash, crawlers): the same 402 challenge as POST, instantly, no upstream calls.
+        A GET that carries a payment is refused without verifying or charging: invocation is POST."""
+        if not (x402 and settings.pricing_enabled) or (
+                path == "/analyze" and not (settings.live_available and settings.mode != "demo")):
+            raise HTTPException(405, f"Use POST {path} with a JSON body.")
+        if payment_header(request)[0]:
+            return JSONResponse({"detail": f"Use POST {path} with a JSON body; the payment was not used or charged."},
+                                status_code=405, headers={"Allow": "POST"})
+        return payment_required(x402.requirements(resource_url(request), description),
+                                "X-PAYMENT header is required", request)
+
+    @app.api_route("/analyze", methods=["GET", "HEAD"], include_in_schema=False)
+    def analyze_probe(request: Request):
+        return get_challenge(request, "/analyze", f"MintScope full NFT risk report ({settings.price_usdc} USDC)")
+
+    @app.post("/analyze")
+    def analyze(body: AnalyzeRequest, request: Request, x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+        authorize(x_api_token)
+        client = request.client.host if request.client else "unknown"
+        if not limiter.allow(client):
+            raise HTTPException(429, f"Local usage limit: {settings.rate_limit_per_minute} analyses per minute.")
+
+        mode, build = make_analysis(body)
 
         if not settings.pricing_enabled:
             return build()
@@ -505,14 +542,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return free_exhausted(request, description, payable=mode != "demo")
         return analyzer.free_view(report, left, settings.free_analyses_per_month, price_info())
 
-    @app.get("/discover")
-    def discover_get(request: Request, period: Literal["today", "week", "month"] = "today",
-                     chain: Literal["all", "ethereum", "base"] = "all", limit: int = 10,
-                     tier: Literal["auto", "free", "full"] = "auto",
-                     x_api_token: str | None = Header(default=None, alias="X-API-Token")):
-        """Find NEW NFT collections launched in the period, analyze and rank them."""
+    @app.api_route("/discover", methods=["GET", "HEAD"], include_in_schema=False)
+    def discover_get(request: Request, period: str = "today", chain: str = "all", limit: str = "10",
+                     tier: str = "auto", x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+        """GET without a payment answers the 402 challenge instantly (no scan); `tier=free` runs the free
+        scan; GET with a payment runs the paid scan. Parameters are validated only after the 402 check."""
+        if (settings.pricing_enabled and x402 and tier != "free" and not payment_header(request)[0]) \
+                or request.method == "HEAD":
+            if request.method == "HEAD" and not (settings.pricing_enabled and x402):
+                return Response(status_code=200)
+            return payment_required(x402.requirements(resource_url(request),
+                                                      f"MintScope new NFT launches, full data ({settings.price_usdc} USDC)"),
+                                    "X-PAYMENT header is required", request)
         try:
-            body = DiscoverRequest(period=period, chain=chain, limit=limit, tier=tier)
+            body = DiscoverRequest(period=period, chain=chain, limit=int(limit), tier=tier)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         return run_discovery(body, request, x_api_token)
@@ -554,6 +597,215 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return tool_manifest.build_discover_manifest(settings)
         except tool_manifest.ManifestNotConfigured as exc:
             raise HTTPException(404, str(exc))
+
+    # ---------------------------------------------------------------- discovery documents (x402scan etc.)
+    X402_GUIDANCE = ("MintScope sells evidence-based NFT data per call with x402 (USDC on Base). POST /analyze "
+                     "with {identifier, chain, tier:'full'} returns a full NFT collection risk report; POST /discover "
+                     "with {period, chain, limit, tier:'full'} returns newly launched NFT collections ranked by risk "
+                     "evidence. Without payment both answer HTTP 402 with x402 v1 (body) and v2 (PAYMENT-REQUIRED "
+                     "header) requirements; sign and resend with PAYMENT-SIGNATURE (v2) or X-PAYMENT (v1). "
+                     "Also available as a remote MCP server at /mcp. Not financial advice or a profit prediction.")
+
+    def openapi_schema() -> dict:
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = get_openapi(title="MintScope AI", version=VERSION, description=app.description, routes=app.routes)
+        schema["info"]["x-guidance"] = X402_GUIDANCE
+        if settings.public_base_url:
+            schema["servers"] = [{"url": settings.public_base_url}]
+            schema["info"]["contact"] = {"name": "MintScope", "url": settings.public_base_url}
+        for path, meta in BAZAAR_ROUTES.items():
+            op = schema.get("paths", {}).get(path, {}).get("post")
+            if not op:
+                continue
+            op["summary"] = {"/analyze": "NFT collection risk report", "/discover": "New NFT launches"}[path]
+            op["description"] = meta["description"]
+            op["requestBody"] = {"required": True, "content": {"application/json": {
+                "schema": copy.deepcopy(meta["body_schema"]), "example": copy.deepcopy(meta["example"])}}}
+            op.setdefault("responses", {})["200"] = {"description": "Report (free summary or paid full report)",
+                "content": {"application/json": {"schema": copy.deepcopy(meta["output_schema"]),
+                                                  "example": copy.deepcopy(meta["output_example"])}}}
+            if x402 and settings.pricing_enabled:
+                op["x-payment-info"] = {"price": {"mode": "fixed", "currency": "USD", "amount": settings.price_usdc},
+                                        "protocols": [{"x402": {}}]}
+                op["responses"]["402"] = {
+                    "description": "Payment Required: x402 v1 challenge in the body, v2 in the PAYMENT-REQUIRED header",
+                    "headers": {"PAYMENT-REQUIRED": {"schema": {"type": "string"},
+                                                     "description": "base64 JSON x402 v2 PaymentRequired"}},
+                    "content": {"application/json": {"schema": {"type": "object", "properties": {
+                        "x402Version": {"type": "integer"}, "error": {"type": "string"},
+                        "accepts": {"type": "array", "items": {"type": "object"}}}}}}}
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = openapi_schema
+
+    def paid_urls(request: Request) -> list[str]:
+        return [f"{public_base(request)}{p}" for p in BAZAAR_ROUTES] if (x402 and settings.pricing_enabled) else []
+
+    @app.get("/.well-known/x402", include_in_schema=False)
+    def well_known_x402(request: Request):
+        return {"version": 1, "resources": paid_urls(request), "instructions": X402_GUIDANCE}
+
+    # ---------------------------------------------------------------- 402 Index domain verification
+    @app.get("/.well-known/402index-verify.txt", include_in_schema=False)
+    def index402_verify():
+        # Public verification hash from 402index.io's domain claim (the claim token itself stays secret, off-repo).
+        value = (os.environ.get("MINTSCOPE_402INDEX_VERIFY") or INDEX402_VERIFY_HASH).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{8,200}", value):
+            raise HTTPException(404, "Not configured.")
+        return PlainTextResponse(value)
+
+    # ---------------------------------------------------------------- ERC-8004 identity
+    @app.get(erc8004.WELL_KNOWN, include_in_schema=False)
+    @app.get("/agent-registration.json", include_in_schema=False)
+    def agent_registration(request: Request):
+        return JSONResponse(erc8004.registration(public_base(request)),
+                            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=300"})
+
+    @app.get("/register-8004", response_class=HTMLResponse, include_in_schema=False)
+    def register_8004(request: Request):
+        """Owner registers MintScope in the ERC-8004 Identity Registry on Base with their own wallet."""
+        return HTMLResponse(erc8004.page(public_base(request)),
+                            headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
+
+    # ---------------------------------------------------------------- MCP (streamable HTTP) + x402
+    def mcp_paid(request: Request, tool: str, path: str, description: str, payment, produce,
+                 error: str = "Payment required") -> dict:
+        if not x402:
+            return mcp_server.error_result("The paid tier is not configured on this server.")
+        requirements = x402.requirements(f"{public_base(request)}{path}", description)
+        resource = {"url": f"mcp://tool/{tool}", "description": BAZAAR_ROUTES[path]["description"],
+                    "mimeType": "application/json"}
+        if not payment:
+            return mcp_server.payment_required_result(payments.payment_required_v2(x402, resource, error, None))
+        if not isinstance(payment, dict):
+            return mcp_server.payment_required_result(payments.payment_required_v2(x402, resource, "invalid_payload", None))
+        try:
+            out = charge(payment, 2 if payment.get("x402Version") == 2 else 1, requirements, produce, f"/mcp/{tool}")
+        except HTTPException as exc:
+            return mcp_server.error_result(str(exc.detail))
+        if out["status"] == "challenge":
+            return mcp_server.payment_required_result(payments.payment_required_v2(x402, resource, out["error"], None))
+        return mcp_server.text_result(out["result"], {mcp_server.PAYMENT_RESPONSE_META: out["receipt"]})
+
+    # MINTSCOPE_MCP_BILLING=gateway only inside an MCPize-hosted container (their gateway charges per call).
+    # Never set it on the public Render service: /mcp would then return paid results without x402.
+    mcp_gateway_billed = (os.environ.get("MINTSCOPE_MCP_BILLING") or "").strip().lower() == "gateway"
+
+    def mcp_guard(request: Request) -> dict | None:
+        try:
+            authorize(request.headers.get("X-API-Token"))
+        except HTTPException as exc:
+            return mcp_server.error_result(str(exc.detail))
+        client = request.client.host if request.client else "unknown"
+        if not limiter.allow(client):
+            return mcp_server.error_result(f"Local usage limit: {settings.rate_limit_per_minute} requests per minute.")
+        return None
+
+    def mcp_free_or_paid(request, tool, path, tier, payment, mode, produce_full, produce_free_raw, free_view):
+        description = f"{paid_descriptions[path]} ({settings.price_usdc} USDC)"
+        try:
+            if mcp_gateway_billed:
+                # Hosted behind the MCPize gateway, which charges per call itself: no second x402 charge.
+                return mcp_server.text_result(produce_full())
+            if not settings.pricing_enabled:
+                return mcp_server.text_result(produce_free_raw())
+            if tier == "full" or (tier == "auto" and payment):
+                if mode == "demo":
+                    return mcp_server.error_result("Paid reports require live data; this server is in demo mode.")
+                return mcp_paid(request, tool, path, description, payment, produce_full)
+            msg = (f"Free tier used up: {settings.free_analyses_per_month} per month. "
+                   f"Full results cost {settings.price_usdc} USDC.")
+            if store.free_used(caller_ids(request), month()) >= settings.free_analyses_per_month:
+                return (mcp_paid(request, tool, path, description, None, produce_full, msg)
+                        if x402 and mode != "demo" else mcp_server.error_result(msg))
+            raw = produce_free_raw()
+            left = use_free(request)
+            if left < 0:
+                return (mcp_paid(request, tool, path, description, None, produce_full, msg)
+                        if x402 and mode != "demo" else mcp_server.error_result(msg))
+            return mcp_server.text_result(free_view(raw, left))
+        except HTTPException as exc:
+            return mcp_server.error_result(str(exc.detail))
+
+    def mcp_analyze(args: dict, meta: dict, request: Request) -> dict:
+        blocked = mcp_guard(request)
+        if blocked:
+            return blocked
+        try:
+            body = AnalyzeRequest(**{k: v for k, v in args.items() if k in ("identifier", "chain", "tier")})
+            mode, build = make_analysis(body)
+        except ValueError as exc:
+            return mcp_server.error_result("Invalid arguments", str(exc)[:500])
+        except HTTPException as exc:
+            return mcp_server.error_result(str(exc.detail))
+        return mcp_free_or_paid(request, "analyze_nft_collection", "/analyze", body.tier,
+                                meta.get(mcp_server.PAYMENT_META), mode,
+                                lambda: {**analyzer.full_view(build()), "tier": "full"}, build,
+                                lambda r, left: analyzer.free_view(r, left, settings.free_analyses_per_month,
+                                                                   price_info()))
+
+    def mcp_discover(args: dict, meta: dict, request: Request) -> dict:
+        blocked = mcp_guard(request)
+        if blocked:
+            return blocked
+        try:
+            body = DiscoverRequest(**{k: v for k, v in args.items() if k in ("period", "chain", "limit", "tier")})
+        except ValueError as exc:
+            return mcp_server.error_result("Invalid arguments", str(exc)[:500])
+        chains = list(discovery.DISCOVERY_CHAINS) if body.chain == "all" else [body.chain]
+
+        def scan() -> dict:
+            with discover_lock:
+                try:
+                    return dict(discoverer.discover(body.period, chains, body.limit))
+                except discovery.DiscoveryError as exc:
+                    raise HTTPException(502, f"Onchain data source error: {exc}")
+        return mcp_free_or_paid(request, "discover_new_nft_collections", "/discover", body.tier,
+                                meta.get(mcp_server.PAYMENT_META), "live",
+                                lambda: {**scan(), "tier": "full"}, scan,
+                                lambda r, left: discovery.free_view(r, left, settings.free_analyses_per_month,
+                                                                    price_info()))
+
+    def mcp_schema(schema: dict) -> dict:
+        out = copy.deepcopy(schema)
+        out["properties"]["tier"]["description"] = (
+            "free = overall score + short summary (limited per month); full = paid result via x402 "
+            "(USDC on Base, sent in params._meta['x402/payment']); auto = full when a payment is attached")
+        return out
+
+    price_meta = ({"price_usdc": settings.price_usdc, "network": x402.caip2, "asset": x402.asset,
+                   "payTo": x402.payee,
+                   "transport": "x402 MCP (_meta x402/payment)"} if x402 else None)
+    mcp = mcp_server.McpServer(
+        name="io.github.ert1981/mintscope", title="MintScope", version=VERSION,
+        instructions="Evidence-based NFT data. Tools return a free summary (limited per month) or, with tier "
+                     "'full', a paid x402 result: the first call answers a PaymentRequired object; retry with the "
+                     "signed payment in _meta['x402/payment']. Not financial advice or a profit prediction.",
+        tools=[
+            mcp_server.Tool("analyze_nft_collection", "NFT collection risk report",
+                            BAZAAR_ROUTES["/analyze"]["description"], mcp_schema(tool_manifest.INPUTS),
+                            mcp_analyze, price_meta),
+            mcp_server.Tool("discover_new_nft_collections", "New NFT launches",
+                            BAZAAR_ROUTES["/discover"]["description"] + " A full scan can take a few minutes.",
+                            mcp_schema(tool_manifest.DISCOVER_INPUTS), mcp_discover, price_meta),
+        ])
+    app.state.mcp = mcp
+
+    @app.post("/mcp", include_in_schema=False)
+    async def mcp_post(request: Request):
+        raw = await request.body()
+        status, payload = await run_in_threadpool(mcp.handle_body, raw, request)
+        if payload is None:
+            return Response(status_code=status)
+        return JSONResponse(payload, status_code=status)
+
+    @app.api_route("/mcp", methods=["GET", "DELETE"], include_in_schema=False)
+    def mcp_other():
+        return JSONResponse({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32000, "message": "Method not allowed: POST JSON-RPC to /mcp"}},
+                            status_code=405, headers={"Allow": "POST"})
 
     return app
 

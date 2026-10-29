@@ -364,3 +364,17 @@ endpoints charge $2.99 per full report; free calls stay available (3/month). The
 | `featured.py` / `routes_featured.py` | featured list, submissions queue, sponsored slots, analytics, admin API |
 | `scripts/build_exe.py`, `.github/workflows/release.yml`, `pyproject.toml` | executables, release CI, pipx install |
 | `tests/` | 130 tests (acceptance, analyzer, regressions, discovery, pricing, local app, license, featured, onchain) |
+
+## Discovery, ERC-8004 and MCP
+
+- `GET /openapi.json`: paid operations carry `x-payment-info` (x402scan discovery); `GET /.well-known/x402` lists them.
+- `GET`/`HEAD /analyze` and `/discover` answer the 402 challenge instantly (probes; nothing is scanned or charged).
+  `GET /discover?tier=free` still runs the free scan; invoke paid calls with `POST`.
+- ERC-8004: `/.well-known/agent-registration.json` (the agentURI) and `/register-8004`, where the owner signs
+  `register(string)` on the Base Identity Registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` with their own
+  wallet. After registering, set `MINTSCOPE_ERC8004_AGENT_ID` so the file lists the registration.
+- MCP: `POST /mcp` (streamable HTTP, JSON responses). Tools `analyze_nft_collection` and
+  `discover_new_nft_collections`; paid calls follow the x402 MCP transport (`_meta["x402/payment"]`).
+  `server.json` is for the official MCP registry (`mcp-publisher publish`), `mcpize.yaml` for MCPize
+  (set `MINTSCOPE_MCP_BILLING=gateway` there only).
+- 402 Index domain verification: the public hash (override with `MINTSCOPE_402INDEX_VERIFY`) is served at `/.well-known/402index-verify.txt`.

@@ -162,11 +162,15 @@ def challenge(requirements: dict, error: str = "X-PAYMENT header is required") -
     return {"x402Version": 1, "error": error, "accepts": [requirements]}
 
 
-def decode_payment(header: str) -> dict:
-    try:
-        payload = json.loads(base64.b64decode(header, validate=False).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        raise PaymentError(402, "invalid_payload")
+def decode_payment(header) -> dict:
+    """Base64 JSON header value (HTTP) or an already-decoded object (MCP `_meta["x402/payment"]`)."""
+    if isinstance(header, dict):
+        payload = header
+    else:
+        try:
+            payload = json.loads(base64.b64decode(header, validate=False).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, TypeError):
+            raise PaymentError(402, "invalid_payload")
     if not isinstance(payload, dict) or not isinstance(payload.get("payload"), dict):
         raise PaymentError(402, "invalid_payload")
     if payload.get("x402Version") == 2 and not isinstance(payload.get("accepted"), dict):

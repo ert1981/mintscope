@@ -1,0 +1,11 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ert1981/mintscope",
+  "title": "MintScope",
+  "description": "Evidence-based NFT collection risk reports and new NFT launches on Ethereum and Base, x402.",
+  "version": "0.7.0",
+  "websiteUrl": "https://mintscope-zrvv.onrender.com/",
+  "repository": {"url": "https://github.com/ert1981/mintscope", "source": "github"},
+  "icons": [{"src": "https://mintscope-zrvv.onrender.com/static/icon.png", "mimeType": "image/png", "sizes": ["512x512"]}],
+  "remotes": [{"type": "streamable-http", "url": "https://mintscope-zrvv.onrender.com/mcp"}]
+}

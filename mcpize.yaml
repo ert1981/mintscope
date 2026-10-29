@@ -1,0 +1,36 @@
+# MCPize deployment config (https://mcpize.com/docs). NOT published yet: needs `mcpize login` + `mcpize deploy`.
+#
+# Billing: MCPize's gateway charges each tools/call with x402 (pricing below) and forwards it to this
+# container. Set MINTSCOPE_MCP_BILLING=gateway in the MCPize secrets/env so the server does not charge a
+# second time. Never set that variable on the public Render service (https://mintscope-zrvv.onrender.com/mcp
+# keeps its own x402 pay-per-call per the x402 MCP transport).
+version: 1
+name: mintscope
+description: Evidence-based NFT collection risk reports and new NFT launches on Ethereum and Base.
+runtime: container
+build:
+  dockerfile: Dockerfile
+startCommand:
+  type: http
+  command: uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers
+configSchema:
+  source: code
+secrets:
+  - name: OPENSEA_API_KEY
+    required: true
+    description: OpenSea API key for live collection data
+  - name: MINTSCOPE_MCP_BILLING
+    required: true
+    description: Must be "gateway" when hosted on MCPize (the gateway bills; avoids double charging)
+pricing:
+  protocol: x402
+  network: base          # base-sepolia for testing
+  recipient: "0x93714D5970f511Ac22f0E5635D3fBF538f717cd4"
+  asset: usdc
+  tools:
+    - name: analyze_nft_collection
+      price: "2.99"
+      description: Full evidence-based NFT collection risk report
+    - name: discover_new_nft_collections
+      price: "2.99"
+      description: New NFT collections launched in the last day, week or month, ranked by risk evidence
