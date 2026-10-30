@@ -152,3 +152,49 @@ def test_page_shows_the_servers_failure_reason(status, body, shown):
     html = x402_pay_page.page("S", PAYEE, [{"id": "a", "name": "A", "path": "/a", "example": {}}], 5_000_000)
     out = run_page(html, {"/a": _challenge()}, clicks=["a"], paidStatus=status, paidBody=body)
     assert f"HTTP {status}" in out["res-a"] and shown in out["res-a"]
+
+
+# ---- wallet choice: MetaMask by default via EIP-6963, picker, Phantom never chosen silently ----------------
+PHANTOM = {"name": "Phantom", "rdns": "app.phantom", "isMetaMask": True, "isPhantom": True, "uuid": "p"}
+METAMASK = {"name": "MetaMask", "rdns": "io.metamask", "isMetaMask": True, "uuid": "m"}
+
+
+def _one_route_page():
+    return x402_pay_page.page("S", PAYEE, [{"id": "a", "name": "A", "path": "/a", "example": {}}], 5_000_000)
+
+
+@needs_node
+def test_metamask_announced_is_the_default_even_when_phantom_owns_window_ethereum():
+    out = run_page(_one_route_page(), {"/a": _challenge()}, wallets=[PHANTOM, METAMASK], windowEthereum=0, clicks=["a"], chainId="0x1")
+    assert out["signedBy"] == ["MetaMask"]
+    assert {name for name, _ in out["walletCalls"]} == {"MetaMask"}  # accounts, chain switch, getCode, sign: all MetaMask
+    methods = [m for _, m in out["walletCalls"]]
+    assert {"eth_accounts", "wallet_switchEthereumChain", "eth_getCode", "eth_signTypedData_v4"} <= set(methods)
+    assert out["picker"]["hidden"] is False
+    assert '<option value="m" selected>MetaMask (io.metamask)</option>' in out["picker"]["html"]
+    assert "Phantom (app.phantom)" in out["picker"]["html"]
+
+
+@needs_node
+def test_picker_switches_wallet_and_remembers_it():
+    out = run_page(_one_route_page(), {"/a": _challenge()}, wallets=[PHANTOM, METAMASK], windowEthereum=0, select="p", clicks=["a"])
+    assert out["signedBy"] == ["Phantom"] and out["store"]["x402pay-wallet"] == "app.phantom"
+    after = [n for n, m in out["walletCalls"] if m in ("eth_requestAccounts", "eth_getCode", "eth_signTypedData_v4")]
+    assert set(after) == {"Phantom"}
+    out = run_page(_one_route_page(), {"/a": _challenge()}, wallets=[PHANTOM, METAMASK], windowEthereum=0,
+                   store={"x402pay-wallet": "app.phantom"}, clicks=["a"])
+    assert out["signedBy"] == ["Phantom"]
+
+
+@needs_node
+def test_without_eip6963_the_providers_array_metamask_that_is_not_phantom_wins():
+    w = [{**PHANTOM, "announce": False}, {**METAMASK, "announce": False}]
+    out = run_page(_one_route_page(), {"/a": _challenge()}, wallets=w, windowEthereum=[0, 1], clicks=["a"])
+    assert out["signedBy"] == ["MetaMask"] and {n for n, _ in out["walletCalls"]} == {"MetaMask"}
+
+
+@needs_node
+def test_only_window_ethereum_is_the_last_fallback():
+    out = run_page(_one_route_page(), {"/a": _challenge()}, wallets=[{**PHANTOM, "announce": False}], windowEthereum=0,
+                   clicks=["a"], wait=1200)
+    assert out["signedBy"] == ["Phantom"]
