@@ -36,6 +36,7 @@ import pages
 import register_page
 import deactivate_page
 import erc8004
+import x402_pay_page
 import mcp_server
 import icon
 import payments
@@ -676,6 +677,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Owner registers MintScope in the ERC-8004 Identity Registry on Base with their own wallet."""
         return HTMLResponse(erc8004.page(public_base(request)),
                             headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
+
+    X402_PAY_NAMES = {"/analyze": "NFT collection risk report (analyze)",
+                      "/discover": "New NFT collections scan (discover; can take a few minutes)"}
+
+    @app.get("/x402-pay", response_class=HTMLResponse, include_in_schema=False)
+    def x402_pay():
+        """Owner pays each paid route once with their own wallet (x402 v2), so the CDP Bazaar indexes it."""
+        routes = [{"id": path.strip("/"), "name": X402_PAY_NAMES[path], "path": path,
+                   "example": BAZAAR_ROUTES[path]["example"]} for path in BAZAAR_ROUTES]
+        return HTMLResponse(x402_pay_page.page("MintScope", settings.payee_address or "", routes, 5_000_000),
+                            headers=x402_pay_page.HEADERS)
 
     # ---------------------------------------------------------------- MCP (streamable HTTP) + x402
     def mcp_paid(request: Request, tool: str, path: str, description: str, payment, produce,
