@@ -657,6 +657,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def well_known_x402(request: Request):
         return {"version": 1, "resources": paid_urls(request), "instructions": X402_GUIDANCE}
 
+    # ---------------------------------------------------------------- Glama listing ownership claim
+    @app.get("/.well-known/glama.json", include_in_schema=False)
+    def glama_claim():
+        # A public verification token (safe to publish); GLAMA_CLAIM overrides it.
+        claim = (os.environ.get("GLAMA_CLAIM") or "glama_claim_qcqbiFgd_HQ6aF4-lOsE09QRleib6h4U").strip()
+        return {"$schema": "https://glama.ai/mcp/schemas/connector.json", "claim": claim}
+
     # ---------------------------------------------------------------- 402 Index domain verification
     @app.get("/.well-known/402index-verify.txt", include_in_schema=False)
     def index402_verify():
