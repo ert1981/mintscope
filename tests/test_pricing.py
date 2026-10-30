@@ -182,7 +182,7 @@ def test_replayed_authorization_is_rejected(priced):
 def test_settle_failure_returns_no_report_and_no_revenue(priced):
     c, _ = priced(Facil(settle_ok=False))
     r = c.post("/analyze", json={"identifier": "abc-coll"}, headers={"X-Payment": payment_header("11")})
-    assert r.status_code == 402 and r.json()["error"] == "settlement_failed"
+    assert r.status_code == 402 and r.json()["error"].startswith("settlement_failed")
     assert "market" not in r.json() and c.get("/ledger").json()["revenue_usd"] == 0
     # Not provably unbroadcast: the authorization stays reserved.
     assert c.post("/analyze", json={"identifier": "abc-coll"}, headers={"X-Payment": payment_header("11")}
@@ -193,7 +193,7 @@ def test_settle_rate_limited_releases_authorization_for_retry(priced):
     facil = Facil(settle_status=429)
     c, _ = priced(facil)
     h = {"X-Payment": payment_header("22")}
-    assert c.post("/analyze", json={"identifier": "abc-coll"}, headers=h).json()["error"] == "settlement_failed"
+    assert c.post("/analyze", json={"identifier": "abc-coll"}, headers=h).json()["error"] == "settlement_failed: HTTP 429: unknown"
     facil.settle_status = 200
     assert c.post("/analyze", json={"identifier": "abc-coll"}, headers=h).status_code == 200
 

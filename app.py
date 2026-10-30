@@ -382,7 +382,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not settled:
             if retryable:
                 store.release_authorization(key)
-            return {"status": "challenge", "error": "settlement_failed"}
+            why = payments.last_settle_error()
+            return {"status": "challenge", "error": f"settlement_failed: {why}"[:240] if why else "settlement_failed"}
         tx = str(settled["transaction"])[:100]
         payer = str(settled.get("payer") or verified.get("payer") or "")[:42]
         store.mark_settled(key, tx)

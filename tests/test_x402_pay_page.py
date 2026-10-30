@@ -129,3 +129,26 @@ def test_cancelled_confirm_signs_nothing_and_double_click_pays_once():
     out = run_page(html, ch, clicks=["a", "b"], concurrent=True)
     assert len(out["confirms"]) == 1 and len(out["signs"]) == 1 and len(out["paid"]) == 1
     assert out["disabled"] == {"pay-a": False, "pay-b": False}  # re-enabled after the single payment finished
+
+
+@needs_node
+def test_page_warns_before_signing_from_a_7702_or_smart_account():
+    html = x402_pay_page.page("S", PAYEE, [{"id": "a", "name": "A", "path": "/a", "example": {}}], 5_000_000)
+    code = "0xef0100" + "69007702764179f14f51cdce752f4f775d74e139"
+    out = run_page(html, {"/a": _challenge()}, clicks=["a"], confirm=False, code=code)
+    assert len(out["confirms"]) == 1 and "EIP-7702 delegation to 0x69007702764179f14f51cdce752f4f775d74e139" in out["confirms"][0]
+    assert "plain EOA" in out["confirms"][0] and out["signs"] == []
+    out = run_page(html, {"/a": _challenge()}, clicks=["a"], confirm=False)
+    assert "WARNING" not in out["confirms"][0]
+
+
+@needs_node
+@pytest.mark.parametrize("status,body,shown", [
+    (502, {"detail": "payment_facilitator_error: HTTP 503: upstream"}, "payment_facilitator_error: HTTP 503: upstream"),
+    (402, {"x402Version": 1, "error": "invalid_exact_evm_payload_signature: bad sig"}, "invalid_exact_evm_payload_signature: bad sig"),
+    (502, {"status": "error", "error": {"code": "X", "message": "from bridgepilot"}}, "from bridgepilot"),
+])
+def test_page_shows_the_servers_failure_reason(status, body, shown):
+    html = x402_pay_page.page("S", PAYEE, [{"id": "a", "name": "A", "path": "/a", "example": {}}], 5_000_000)
+    out = run_page(html, {"/a": _challenge()}, clicks=["a"], paidStatus=status, paidBody=body)
+    assert f"HTTP {status}" in out["res-a"] and shown in out["res-a"]

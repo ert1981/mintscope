@@ -358,3 +358,83 @@ def test_bazaar_metadata_has_no_agent_directed_instructions(priced, path):
     v2 = v2_header(c.post(path, json={}))
     for s in _strings({"resource": v2["resource"], "extensions": v2["extensions"]}):
         assert not _INSTRUCTION.search(s), s
+
+
+# ---- facilitator failures: real reason, logged and returned (2026-10-30 live 502s) --------------------
+CDP_400 = ('Facilitator verify failed (400): {"invalidMessage":"invalid signature: recovery failed",'
+           '"invalidReason":"invalid_exact_evm_payload_signature","isValid":false,"payer":"0xabab"}')
+
+
+def _sdk_raises(msg):
+    def f(p, r):
+        raise ValueError(msg)
+    return f
+
+
+def test_cdp_400_invalid_payment_is_a_402_with_cdps_reason_not_a_502(monkeypatch, caplog):
+    pytest.importorskip("cdp.x402")
+    f = payments.CdpFacilitator("fake-id", "fake-secret")
+    monkeypatch.setattr(f.client, "verify_from_bytes", _sdk_raises(CDP_400))
+    with caplog.at_level("WARNING", logger="mintscope.x402"):
+        with pytest.raises(payments.PaymentError) as e:
+            f.verify({}, {})
+    assert e.value.status == 402
+    assert e.value.error == "invalid_exact_evm_payload_signature: invalid signature: recovery failed"
+    assert "HTTP 400" in caplog.text and "invalid_exact_evm_payload_signature" in caplog.text
+
+
+def test_cdp_self_send_reason_is_passed_through(monkeypatch):
+    pytest.importorskip("cdp.x402")
+    f = payments.CdpFacilitator("fake-id", "fake-secret")
+    monkeypatch.setattr(f.client, "verify_from_bytes", _sdk_raises(
+        'Facilitator verify failed (400): {"invalidReason":"self_send_not_allowed","isValid":false}'))
+    with pytest.raises(payments.PaymentError) as e:
+        f.verify({}, {})
+    assert (e.value.status, e.value.error) == (402, "self_send_not_allowed")
+
+
+@pytest.mark.parametrize("msg,status", [
+    ('Facilitator verify failed (401): {"errorType":"unauthorized","errorMessage":"invalid JWT"}', 401),
+    ('Facilitator verify failed (500): {"errorType":"internal_error","errorMessage":"boom 0x' + "cd" * 65 + '"}', 500),
+])
+def test_cdp_auth_or_server_errors_are_502_with_status_and_reason_but_no_signature(monkeypatch, caplog, msg, status):
+    pytest.importorskip("cdp.x402")
+    f = payments.CdpFacilitator("fake-id", "fake-secret")
+    monkeypatch.setattr(f.client, "verify_from_bytes", _sdk_raises(msg))
+    with caplog.at_level("WARNING", logger="mintscope.x402"):
+        with pytest.raises(payments.PaymentError) as e:
+            f.verify({}, {})
+    assert e.value.status == 502 and e.value.error.startswith(f"payment_facilitator_error: HTTP {status}: ")
+    assert ("unauthorized: invalid JWT" if status == 401 else "internal_error: boom 0x…") in e.value.error
+    assert "cd" * 40 not in e.value.error and "cd" * 40 not in caplog.text
+
+
+def test_cdp_settle_failure_reason_reaches_the_payer(cdp_wire, monkeypatch):
+    from x402.http import HTTPFacilitatorClientSync
+    c, sent = cdp_wire
+    monkeypatch.setattr(HTTPFacilitatorClientSync, "settle_from_bytes", lambda self, p, r: (_ for _ in ()).throw(
+        ValueError('Facilitator settle failed (400): {"errorReason":"invalid_transaction_state","success":false}')))
+    r = c.post("/analyze", json={"identifier": "real", "tier": "full"}, headers={"PAYMENT-SIGNATURE": _v2_bare("d1")})
+    assert r.status_code == 402
+    assert r.json()["error"] == "settlement_failed: HTTP 400: invalid_transaction_state"
+
+
+def test_http_route_shows_cdp_verify_rejection_reason(cdp_wire, monkeypatch):
+    from x402.http import HTTPFacilitatorClientSync
+    c, _ = cdp_wire
+    monkeypatch.setattr(HTTPFacilitatorClientSync, "verify_from_bytes", lambda self, p, r: (_ for _ in ()).throw(ValueError(CDP_400)))
+    r = c.post("/analyze", json={"identifier": "real", "tier": "full"}, headers={"PAYMENT-SIGNATURE": _v2_bare("d2")})
+    assert r.status_code == 402 and r.json()["error"].startswith("invalid_exact_evm_payload_signature")
+    monkeypatch.setattr(HTTPFacilitatorClientSync, "verify_from_bytes", lambda self, p, r: (_ for _ in ()).throw(
+        ValueError('Facilitator verify failed (503): upstream unavailable')))
+    r = c.post("/analyze", json={"identifier": "real", "tier": "full"}, headers={"PAYMENT-SIGNATURE": _v2_bare("d3")})
+    assert r.status_code == 502 and r.json()["detail"] == "payment_facilitator_error: HTTP 503: upstream unavailable"
+
+
+def test_payai_non_200_verify_with_reason_is_402(priced, monkeypatch):
+    from tests.test_acceptance import FakeResp
+    c, _ = priced()
+    monkeypatch.setattr(payments.requests, "post", lambda url, json=None, timeout=None: FakeResp(
+        400, {"isValid": False, "invalidReason": "invalid_exact_evm_payload_signature"}))
+    r = c.post("/analyze", json={"identifier": "real", "tier": "full"}, headers={"PAYMENT-SIGNATURE": v2_payment("d4")})
+    assert r.status_code == 402 and r.json()["error"] == "invalid_exact_evm_payload_signature"
