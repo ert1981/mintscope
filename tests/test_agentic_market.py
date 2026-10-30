@@ -256,3 +256,105 @@ def test_no_secret_strings_in_new_code():
     for name in ("payments.py", "app.py", "icon.py"):
         text = (root / name).read_text()
         assert not re.search(r"-----BEGIN|organizations/[0-9a-f-]{20,}/apiKeys", text)
+
+
+# ---- CDP settle payloads carry resource + extensions.bazaar (Bazaar indexing) ------------------------
+def _v2_bare(nonce_byte):
+    body = json.loads(base64.b64decode(v2_payment(nonce_byte)))
+    body.pop("resource")
+    return base64.b64encode(json.dumps(body).encode()).decode()
+
+
+@pytest.fixture
+def cdp_wire(priced, monkeypatch):
+    """App with the real CdpFacilitator (fake keys); the x402 SDK transport is replaced by a recorder."""
+    pytest.importorskip("cdp.x402")
+    from x402.http import HTTPFacilitatorClientSync
+    from x402.schemas import SettleResponse, VerifyResponse
+    sent = []
+
+    def verify(self, p, r):
+        sent.append(("verify", json.loads(p), json.loads(r)))
+        return VerifyResponse(is_valid=True, payer=PAYER)
+
+    def settle(self, p, r):
+        sent.append(("settle", json.loads(p), json.loads(r)))
+        return SettleResponse(success=True, transaction=TX, network="eip155:8453", payer=PAYER)
+    monkeypatch.setattr(HTTPFacilitatorClientSync, "verify_from_bytes", verify)
+    monkeypatch.setattr(HTTPFacilitatorClientSync, "settle_from_bytes", settle)
+    monkeypatch.setenv("CDP_API_KEY_ID", "fake-id-for-tests")
+    monkeypatch.setenv("CDP_API_KEY_SECRET", "fake-secret-for-tests")
+    c, _ = priced()
+    assert c.app.state.facilitator_kind == "cdp"
+    return c, sent
+
+
+@pytest.mark.parametrize("path,body", [("/analyze", {"identifier": "real", "tier": "full"}),
+                                       ("/discover", DISCOVER_EXAMPLE)])
+def test_cdp_v2_payloads_carry_resource_and_bazaar_from_the_402(cdp_wire, path, body, monkeypatch):
+    import discovery
+    monkeypatch.setattr(discovery.Discoverer, "discover",
+                        lambda self, *a, **k: {"period": "today", "chain": "all", "results": []})
+    c, sent = cdp_wire
+    challenge = v2_header(c.post(path, json={}))
+    r = c.post(path, json=body, headers={"PAYMENT-SIGNATURE": _v2_bare("c1" if path == "/analyze" else "c2")})
+    assert r.status_code == 200, r.text
+    assert [k for k, _, _ in sent] == ["verify", "settle"]
+    for _, payload, reqs in sent:
+        assert payload["resource"] == challenge["resource"]
+        assert payload["extensions"]["bazaar"] == challenge["extensions"]["bazaar"]
+        assert payload["payload"]["authorization"]["nonce"].startswith("0x")  # signed part forwarded as sent
+        assert reqs["amount"] == challenge["accepts"][0]["amount"]
+
+
+def test_cdp_keeps_client_sent_resource_and_extensions(cdp_wire):
+    c, sent = cdp_wire
+    own = json.loads(base64.b64decode(v2_payment("c3")))
+    own["extensions"] = {"other": {"a": 1}}
+    r = c.post("/analyze", json={"identifier": "real", "tier": "full"},
+               headers={"PAYMENT-SIGNATURE": base64.b64encode(json.dumps(own).encode()).decode()})
+    assert r.status_code == 200
+    payload = sent[-1][1]
+    assert payload["resource"] == {"url": "https://mintscope.test/analyze"}
+    assert payload["extensions"]["other"] == {"a": 1} and payload["extensions"]["bazaar"]["info"]["input"]["body"]
+
+
+def test_cdp_v1_payment_is_forwarded_unchanged(cdp_wire):
+    c, sent = cdp_wire
+    hdr = payment_header("c4")
+    r = c.post("/analyze", json={"identifier": "real", "tier": "full"}, headers={"X-Payment": hdr})
+    assert r.status_code == 200
+    assert sent[-1][1] == json.loads(base64.b64decode(hdr))
+
+
+def test_payai_v2_payload_is_forwarded_exactly_as_sent(priced):
+    facil = FacilV2()
+    c, _ = priced(facil)
+    hdr = _v2_bare("c5")
+    assert c.post("/analyze", json={"identifier": "real", "tier": "full"},
+                  headers={"PAYMENT-SIGNATURE": hdr}).status_code == 200
+    for _, sent in facil.calls:
+        assert sent["paymentPayload"] == json.loads(base64.b64decode(hdr))
+
+
+_INSTRUCTION = re.compile(r"\b(ignore|disregard|you must|you should|always (call|use|pay)|never (call|use)|"
+                          r"agents? (must|should)|instructions?|system prompt|do not tell|override|prefer this)\b", re.I)
+
+
+def _strings(v):
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from _strings(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from _strings(x)
+
+
+@pytest.mark.parametrize("path", ["/analyze", "/discover"])
+def test_bazaar_metadata_has_no_agent_directed_instructions(priced, path):
+    c, _ = priced()
+    v2 = v2_header(c.post(path, json={}))
+    for s in _strings({"resource": v2["resource"], "extensions": v2["extensions"]}):
+        assert not _INSTRUCTION.search(s), s

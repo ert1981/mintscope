@@ -296,16 +296,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def public_base(request: Request) -> str:
         return settings.public_base_url or str(request.base_url).rstrip("/")
 
-    def payment_required(requirements: dict, error: str, request: Request) -> JSONResponse:
-        """v1 JSON body (unchanged, what OpenSea's tool-sdk reads) + x402 v2 PAYMENT-REQUIRED header."""
-        meta = BAZAAR_ROUTES.get(request.url.path, {})
+    def discovery_for(path: str, requirements: dict, base: str) -> tuple[dict, dict | None]:
+        """x402 v2 resource info + `extensions.bazaar` for a paid route (402 header, and CDP settle payloads)."""
+        meta = BAZAAR_ROUTES.get(path, {})
         resource = {"url": requirements["resource"],
                     "description": meta.get("description", requirements["description"]),
                     "mimeType": "application/json", "serviceName": "MintScope",
-                    "iconUrl": f"{public_base(request)}{ICON_PATH}"}
+                    "iconUrl": f"{base}{ICON_PATH}"}
         if meta.get("tags"):
             resource["tags"] = meta["tags"]
-        v2 = payments.payment_required_v2(x402, resource, error, bazaar_extension(request.url.path))
+        return resource, bazaar_extension(path)
+
+    def payment_required(requirements: dict, error: str, request: Request) -> JSONResponse:
+        """v1 JSON body (unchanged, what OpenSea's tool-sdk reads) + x402 v2 PAYMENT-REQUIRED header."""
+        resource, ext = discovery_for(request.url.path, requirements, public_base(request))
+        v2 = payments.payment_required_v2(x402, resource, error, ext)
         return JSONResponse(payments.challenge(requirements, error), status_code=402, headers={
             "X-Accept-Payment": "x402",
             payments.PAYMENT_REQUIRED_HEADER: payments.encode_header(v2),
@@ -335,12 +340,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         header, version = payment_header(request)
         if not header:
             return payment_required(requirements, "X-PAYMENT header is required", request)
-        out = charge(header, version, requirements, produce, request.url.path)
+        out = charge(header, version, requirements, produce, request.url.path, public_base(request))
         if out["status"] == "challenge":
             return payment_required(requirements, out["error"], request)
         return JSONResponse(out["result"], headers=out["headers"])
 
-    def charge(header, version: int, requirements: dict, produce, path: str) -> dict:
+    def charge(header, version: int, requirements: dict, produce, path: str, base: str | None = None) -> dict:
         """verify -> replay reservation -> produce -> settle. Shared by HTTP routes and MCP tool calls.
         Returns {"status": "challenge", "error"} or {"status": "ok", "result", "headers", "receipt"}."""
         try:
@@ -353,6 +358,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if any(str(accepted.get(k, "")).lower() != str(facil_requirements[k]).lower()
                        for k in ("scheme", "network", "asset", "amount", "payTo")):
                     raise payments.PaymentError(402, "payment_requirements_mismatch")
+                if facilitator.kind == "cdp" and base is not None and path in BAZAAR_ROUTES:
+                    # CDP Bazaar indexes the route from these on settle. PayAI payloads stay exactly as sent.
+                    payment = payments.with_discovery(payment, *discovery_for(path, requirements, base))
             else:
                 facil_requirements = requirements
             verified = facilitator.verify(payment, facil_requirements)

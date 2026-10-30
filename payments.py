@@ -286,6 +286,20 @@ class CdpFacilitator:
         return data, False
 
 
+def with_discovery(payment: dict, resource: dict, extensions: dict | None) -> dict:
+    """CDP Bazaar indexing needs paymentPayload.resource and paymentPayload.extensions.bazaar on settle.
+    Fields the client already sent are kept; the signed authorization is not touched."""
+    out = dict(payment)
+    if out.get("resource") is None:
+        out["resource"] = resource
+    bazaar = (extensions or {}).get("bazaar")
+    if bazaar is not None:
+        ext = dict(out["extensions"]) if isinstance(out.get("extensions"), dict) else {}
+        ext.setdefault("bazaar", bazaar)
+        out["extensions"] = ext
+    return out
+
+
 def make_facilitator(settings_url: str, env=None):
     """CDP only when BOTH key env vars are set; otherwise the configured (PayAI) facilitator, unchanged."""
     env = os.environ if env is None else env
